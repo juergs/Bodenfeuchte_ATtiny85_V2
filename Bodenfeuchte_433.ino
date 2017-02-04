@@ -3,25 +3,29 @@
  *  Thanks to TantaJu@https://forum.fhem.de/index.php/topic,57460.0.html
  *  
  *  juergs, 16.10.2016, initial version.
+ *  juergs, 04.02.2017, reorganized version. (Temp-Dallas-Sensor added.)
  *  
  *  *********************************************************************
- *  ATMEL ATTINY 25/45/85 / ARDUINO
+ *  ATMEL ATTINY 25/45/85 omly!
  *
  *                      +-\/-+
- *     Ain0 (D 5) PB5  1|    |8  Vcc
- *     Ain3 (D 3) PB3  2|    |7  PB2 (D 2) Ain1 *INT2*
- *     Ain2 (D 4) PB4  3|    |6  PB1 (D 1) pwm1 *INT1*
- *                GND  4|    |5  PB0 (D 0) pwm0 *INT0*
+ *     RES   (D5) PB5  1|    |8  Vcc
+ *     TX433 (D3) PB3  2|    |7  PB2 (D 2) Ain1  Bodenfeuchte-Pulse  
+ *     Serial(D4) PB4  3|    |6  PB1 (D 1) pwm1  Bodenfeuchte-Power
+ *                GND  4|    |5  PB0 (D 0) pwm0  Dallas-Sensor Data DQ
                         +----+
  *  
  *  Install: ATtiny-Models in Arduino IDE:
  *  http://highlowtech.org/?p=1695
+ *  https://raw.githubusercontent.com/damellis/attiny/ide-1.6.x-boards-manager/package_damellis_attiny_index.json,   -> for preferences additional board manager url + installation
  *  
  *  ATTINY:  
  *    https://cpldcpu.wordpress.com/2014/04/25/the-nanite-85/ 
  *    https://thewanderingengineer.com/2014/08/11/pin-change-interrupts-on-attiny85/
  *  
- *  
+ *  LaCrosse-TH3-protocol decoded:
+ *    http://www.f6fbb.org/domo/sensors/tx3_th.php
+ *    
  * The LaCrosse-protocol seems to be:
  *
  *     Bits 0-3: header
@@ -40,25 +44,25 @@
 /******************************************************************************************************************************************************/
 /* ATtiny 84/85 SerialMonitor Test */
 
-//    Senden via "SoftwareSerial" - TX an Pin  4 (= Pin3 am Attiny85-20PU)
-//    Senden via "SoftwareSerial" - TX an Pin  7 (= Pin6 am Attiny84-10PU)
+// Senden via "SoftwareSerial" - TX an Pin  4 (= Pin3 am Attiny85-20PU)
+// Senden via "SoftwareSerial" - TX an Pin  7 (= Pin6 am Attiny84-10PU)
 // Empfangen via "SoftwareSerial" - RX an Pin 99 (Dummy um Hardwarepin zu sparen)
-
 #include <SoftwareSerial.h>
+
+#include <avr/power.h>  // for adc power save 
 
 #include "Narcoleptic.h"
 #include "LaCrosse.h"
 #include "OneWire.h"
 
-#define SN ("Bodenfeuchte-Sensor-433-Version")
-#define SV ("1.0 vom 16.10.2016")
+#define SN ("Bodenfeuchte-Sensor-433-Version 2")
+#define SV ("2.0 vom 04.02.2017")
 
 //--- conditionals
-//--- zum aktivieren Kommentierung entfernen 
-//#define USE_WITH_NANO            
+//--- zum aktivieren Kommentierung entfernen            
 //#define USE_SEPARATE_BATTERIE_ID 
-#define USE_WITH_DALLAS_SENSOR          
-//#define USE_WITH_LED
+#define USE_WITH_DALLAS_SENSOR 
+//#define USE_SOFT_SERIAL_FOR_DEBUG         
 
 #define DALLAS_SENSOR_PIN         0     //   DIP.5 = PB0 = D0 - Achtung: MOSI, Jumper zum Programmieren entfernen.
 #define BODENFEUCHTE_POWER_PIN    1     //   
@@ -83,35 +87,28 @@
 /*
  * Nothing to normally configure beyond this line, hardware specific configs follow
  */
-#define POWERAMV          1   // Output line to provide power for the AMV
-#define INPUTFREQ         2   // IRQ input for frequency count. Must be 2 or 3
+#define POWERAMV          BODENFEUCHTE_POWER_PIN    // Output line to provide power for the AMV
+#define INPUTFREQ         BODENFEUCHTE_SENSOR_PIN   // IRQ input for frequency count. Must be 2 or 3
 
-#define CHILD_ID          0   // Child-Number for Humidity
-#define CHILD_TEMP        1   // Child-Number for Temperature, if attached
+#define MAIN_PERIOD       998   // How long to count pulses, for a fixed frequency this should be 998 ms (for a total runtime of 1 sec with 1 MHz oscillator)
+#define SETTLE_TIME       1000   // Waiting time in ms between powering up AMV and stable frequency
 
-#define BATTPOWER         1   // ADC Input for Battery-Power, comment out if no Step-Up is used
-
-#define MAIN_PERIOD     998   // How long to count pulses, for a fixed frequency this should be 998 ms (for a total runtime of 1 sec with 1 MHz oscillator)
-#define SETTLE_TIME     1000   // Waiting time in ms between powering up AMV and stable frequency
-
-#ifdef WITH_LED
-  #define LED_WS            5   // White LED, normal operation
-  #define LED_RO            6   // Red LED, Error
-  #define LED_MAIN          4   // Mains for LEDs, must be set LOW for LEDs to work
-#endif 
+#define DEEP_SLEEP_MINUTES  3    // duration of sleep phase
 
 //--- globals
-SoftwareSerial          softSerial(99, 4); // RX, TX   // bei Tiny 85
-OneWire                 dallas(DALLAS_SENSOR_PIN);  // on arduino port pin 2 (a 4.7K resistor is necessary, between Vcc and DQ-Pin   1=GND 2=DQ 3=Vcc )
+#ifdef USE_SOFT_SERIAL_FOR_DEBUG
+  SoftwareSerial            softSerial(99, 4);            // RX, TX   // bei Tiny 85
+#endif 
+OneWire                   dallas(DALLAS_SENSOR_PIN);  // on arduino port pin 2 (a 4.7K resistor is necessary, between Vcc and DQ-Pin   1=GND 2=DQ 3=Vcc )
 
-unsigned int            led_startup;
-float                   controller_VCC = 0.0; 
-long                    vcc_reading    = 0;
+unsigned int              led_startup;
+float                     controller_VCC = 0.0; 
+long                      lngVcc    = 0;
 
 /*
  * Internals to follow, nothing to adjust
  */
-volatile unsigned int   pulsecount = 0;   // Counter for pulses
+volatile unsigned int   pulsecount = 0;           // Counter
 unsigned int            average;                 // IIR floating average filter
 unsigned long           statestart;             // Storage for statemachine timer
 int                     my_state;                         // actual state of statemachine
@@ -127,75 +124,58 @@ float ReadSingleOneWireSensor(OneWire ds);
 //---------------------------------------------------------------------
 void setup() 
 {
-  //--- setup code here
-  
-  #if USE_WITH_NANO
-      Serial.begin(9600);  
-      delay(2000);    
-      Serial.println("Start Bodenfeuchte-Sensor.");  
-      pinMode(13, OUTPUT);
-      digitalWrite(13,LOW); 
-   #else
-      //--- ATtiny free pin D4
-      pinMode(4, OUTPUT);
-      digitalWrite(4,LOW);
-   #endif 
-
+  //--- setup    
   //--- make power-line for AMV output and low
-  pinMode(POWERAMV, OUTPUT);
-  digitalWrite(POWERAMV,LOW);
-
+  pinMode(BODENFEUCHTE_POWER_PIN, OUTPUT);  // PowerPin fpor soilmoisture-circuit 
+  digitalWrite(BODENFEUCHTE_POWER_PIN, LOW); // off
+  pinMode(BODENFEUCHTE_SENSOR_PIN, INPUT);  // pulse-input-pin for soilmoisture-circuit 
+  
   //--- preset SensorId & TX instance 
-  LaCrosse.bSensorId = SENSORID_BODENFEUCHTE;
-  LaCrosse.setTxPinMode(OUTPUT);
+  LaCrosse.bSensorId = SENSORID_BODENFEUCHTE;  
+  pinMode(TX_433_PIN, OUTPUT);  // PowerPin fpor soilmoisture-circuit 
+  digitalWrite(TX_433_PIN, LOW); 
 
+  //--- init Softwareserial, only 1 pin is used, trick: rx defined as pin 99! 
+  //--- needs more flash memory! 
+  #ifdef USE_SOFT_SERIAL_FOR_DEBUG
   softSerial.begin(38400);
-  delay(5000);  
-  //softSerial.print  (F("***START ")); softSerial.println();
+  #endif
+  delay(1000);    
 }
 //---------------------------------------------------------------------
 void loop() 
 {
-  // put your main code here, to run repeatedly:
-  #if USE_WITH_NANO
-    Serial.print("Temp.: ");
-    Serial.print(( (float) temp_mittel/10.0) + temp_offset, 1);
-    Serial.print(" Druck: ");
-    Serial.print(((float)druck_mittel/100.0)+druck_offset, 2);
-    Serial.print(" Druck[corr]: ");
-    Serial.println((float) luftdruck, 2);  
-  #endif
+  // comming from wake-up?
+  //pinMode(DALLAS_SENSOR_PIN, OUTPUT);
+  LaCrosse.setTxPinMode(OUTPUT);
   
-  delay(1000); // ms
-
-  #if USE_WITH_NANO
-    digitalWrite(13,HIGH);
-  #else
-    //digitalWrite(4,HIGH);
-  #endif 
-
-  //--- Betriebsspannung auslesen  
-  vcc_reading   = getVcc(); 
-  controller_VCC = 1.1 * 1023 / vcc_reading; 
-
-  softSerial.print("Vcc: ");
-  softSerial.print( (float) controller_VCC, 1);
- // softSerial.print("    Vcc_read: ");
- // softSerial.print(vcc_reading);
-  softSerial.print("    ");
+  power_adc_enable();
+  delay(500); // ms, needed for settling DS18B20
   
-  //--- Bodenfeuchte auslesen 
+  //--- [0] Betriebsspannung auslesen  
+  lngVcc          = getVcc();   // as long
+  controller_VCC  = (lngVcc/1000.0);  // as float in Volt, not millivolts (sent as HUM !
+
+  //--- [1] Bodenfeuchte auslesen 
   bodenfeuchte = DoBodenFeuchteMeasurement(); 
-  //bodenfeuchte = 1.0; 
   
-  softSerial.print("Feuchte: ");
-  softSerial.print( (float) bodenfeuchte, 1);
-  softSerial.print("    ");
-
+  //--- [2] read Dallas-Sensor
   float theta = ReadSingleOneWireSensor(dallas);
-  softSerial.print("Temp: ");
-  softSerial.println( (float) theta, 1);
 
+  #ifdef USE_SOFT_SERIAL_FOR_DEBUG
+    //--- debug-output-block
+    //softSerial.print("Vcc: ");
+    //softSerial.print( (float) controller_VCC, 1);
+    //softSerial.print("   Vcc_read: ");
+    //softSerial.print((long) lngVcc);
+    //softSerial.print("   ");  
+    softSerial.print("Feuchte: ");
+    softSerial.print( (float) bodenfeuchte, 1);
+    softSerial.print("    ");
+    softSerial.print("Temp: ");
+    softSerial.println( (float) theta, 1);
+  #endif 
+  
   //--- transfer measured values to LaCrosse-instance
   LaCrosse.bSensorId = SENSORID_BODENFEUCHTE;
   LaCrosse.t = theta;    //--- alias temperature;  
@@ -207,35 +187,23 @@ void loop()
     LaCrosse.bSensorId = SENSORID_BATTERIE;
   #endif 
   
-  LaCrosse.h = controller_VCC;        //--- alias luftdruck;
+  LaCrosse.h = bodenfeuchte/1000; //   controller_VCC;    
   LaCrosse.sendHumidity();
-
-  #if USE_WITH_NANO
-    digitalWrite(13,LOW);
-  #else
-    //digitalWrite(4,LOW);
-  #endif
-
   LaCrosse.sleep(1);        /* 1 second, no power-reduction! */
 
-  #if USE_WITH_NANO
-    digitalWrite(13,HIGH);
-  
-    long vcc = readVcc(); 
-    Serial.print("VCC = ");
-    Serial.println(vcc,DEC);  
-    Serial.println("==============================================="); 
-    Serial.println();
-  #endif 
 
-  #if USE_WITH_NANO
-    digitalWrite(13,LOW);
-    delay(60000); // ms
-  #else
-    ///Narcoleptic.delay_minutes(3);
+  //--- preserve more power during sleep phase 
+  pinMode(DALLAS_SENSOR_PIN, INPUT);  
+  LaCrosse.setTxPinMode(INPUT);
 
-    delay(10000); // ms
-  #endif 
+  //--- switch AD-converter off
+  power_adc_disable(); 
+
+  //--- fall to deep powersave-sleep, see notes in comments and 
+  Narcoleptic.delay_minutes(DEEP_SLEEP_MINUTES);
+
+  //--- deep sleep or test?
+  //delay(10000); // 10 Sec 
 }
 //---------------------------------------------------------------------
 long getVcc() 
@@ -251,25 +219,28 @@ long getVcc()
   #else
     ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
   #endif  
-
-  delay(2); // Wait for Vref to settle
   
-  ADCSRA |= _BV(ADSC); // Start conversion
-  while (bit_is_set(ADCSRA,ADSC)); // measuring
+  delay(2); // Wait for Vref to settle
 
-  uint8_t low  = ADCL; // must read ADCL first - it then locks ADCH  
+  ADCSRA |= _BV(ADSC); // Start conversion
+  while (bit_is_set(ADCSRA, ADSC)); // measuring
+
+  uint8_t low = ADCL; // must read ADCL first - it then locks ADCH  
   uint8_t high = ADCH; // unlocks both
 
-  long result = (high<<8) | low;
+  long result = (high << 8) | low;
 
-/*
- *        internal1.1Ref = 1.1 * Vcc1 (per voltmeter) / Vcc2 (per readVcc() function)
-                         = 1.1 * 5126 / 5258 => 1.09 ==> 1.09*1023*1000 = 1097049
-*/ 
+  /***************************************************************************************
+  *  Berechnung/Skalierung mit manueller Messung der Betriebsspannung:
+  *
+  *        internal1.1Ref = 1.1 * Vcc1 (per voltmeter) / Vcc2 (per readVcc() function)
+  *                       = 1.1 * 5126         / 5258 => 1.09 ==> 1.09*1023*1000 = 1097049
+  ****************************************************************************************/
 
-  //result = 1125300L / result; // Calculate Vcc (in mV); 1125300 = 1.1*1023*1000
-  result   = 1097049L / result; // korrigierter Wert
-  
+  result = 1125300L / result; // Calculate Vcc (in mV); 1125300 = 1.1*1023*1000
+
+ //result = 1097049L / result; // korrigierter Wert bei 3V3 muesste fuer jeden Controller bestimmt werden, obiger Wert scheint allgemeiner zu sein.
+
   return result; // Vcc in millivolts
 }
 //---------------------------------------------------------------------
@@ -281,19 +252,20 @@ void myinthandler() // interrupt handler
 float DoBodenFeuchteMeasurement()
 {
     //--- [1] startUp Multivibrator
-    pinMode(INPUTFREQ, INPUT);     
+    pinMode(INPUTFREQ, INPUT_PULLUP);     
     pinMode(POWERAMV, OUTPUT);      
     digitalWrite(POWERAMV, HIGH);   //--- power up sensor circuit  
-  
+    digitalWrite(INPUTFREQ, HIGH);  // activate pullups
+    
     //--- [2] wait for settle
-    delay( SETTLE_TIME);
+    delay(SETTLE_TIME);
 
     //--- [3] Prepare measurement
     pulsecount = 0;
     #if INPUTFREQ == 2
-          attachInterrupt(0, myinthandler, FALLING); // IRQ D2 low to high
-    #elif INPUTFREQ == 3
-          attachInterrupt(1, myinthandler, FALLING); // IRQ D2 low to high
+          attachInterrupt(0, myinthandler, FALLING); // IRQ D2 high to low
+//    #elif INPUTFREQ == 3
+//          attachInterrupt(1, myinthandler, FALLING); // IRQ D2
     #else
       #error "Frequency input must be D2 or D3"
     #endif
@@ -315,13 +287,12 @@ float DoBodenFeuchteMeasurement()
     digitalWrite(POWERAMV, LOW);
     #if INPUTFREQ == 2
           detachInterrupt(0);
-    #elif INPUTFREQ == 3
-          detachInterrupt(1);
+//    #elif INPUTFREQ == 3
+//          detachInterrupt(1);
     #else
-      #error "Frequency input must be D2 or D3"
+      #error "Frequency input must be D2 for ATtiny"
     #endif
     
-    pinMode(INPUTFREQ, INPUT);
 
     //--- [7] result set reading  for TX 
    return (average * 1.0); 
@@ -420,6 +391,16 @@ float ReadSingleOneWireSensor(OneWire ds)
   };
   return celsius;
 }
+//-------------------------------------------------------------------------
+void blink(byte pin, int delay_ms)
+{
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, HIGH);
+  delay(delay_ms);
+  digitalWrite(pin, LOW);
+  delay(delay_ms);
+}
+//---------------------------------------------------------------------
 //---------------------------------------------------------------------
 //---------------------------------------------------------------------
 // <eof>
